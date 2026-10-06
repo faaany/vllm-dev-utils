@@ -1,0 +1,40 @@
+# Model runner V2 vs V1: per-step CPU time of input preparation, forward and sampling.
+# Written for vLLM 0.29 and DeepSeek-OCR; change the model line for other models.
+# Lines for the runner that isn't active simply record no calls.
+
+# --- Worker level (both runners) ---
+vllm.v1.worker.gpu_worker:Worker.execute_model
+vllm.v1.worker.gpu_worker:Worker.sample_tokens
+
+# --- Model (same code for both runners) ---
+vllm.model_executor.models.deepseek_ocr:DeepseekOCRForCausalLM.forward
+vllm.model_executor.models.deepseek_ocr:DeepseekOCRForCausalLM.compute_logits
+
+# --- V2 model runner (vllm/v1/worker/gpu/) ---
+vllm.v1.worker.gpu.model_runner:GPUModelRunner.execute_model
+vllm.v1.worker.gpu.model_runner:GPUModelRunner.update_requests
+vllm.v1.worker.gpu.model_runner:GPUModelRunner.prepare_inputs
+vllm.v1.worker.gpu.model_runner:GPUModelRunner.prepare_attn
+vllm.v1.worker.gpu.model_runner:GPUModelRunner.sample_tokens
+vllm.v1.worker.gpu.model_runner:GPUModelRunner.sample
+vllm.v1.worker.gpu.model_runner:GPUModelRunner.postprocess_sampled
+vllm.v1.worker.gpu.model_runner:post_update
+vllm.v1.worker.gpu.sample.sampler:Sampler.__call__
+vllm.v1.worker.gpu.sample.sampler:Sampler.sample
+vllm.v1.worker.gpu.sample.sampler:Sampler.apply_sampling_params
+vllm.v1.worker.gpu.sample.sampler:gumbel_sample
+vllm.v1.worker.gpu.sample.sampler:get_num_sampled_and_rejected
+vllm.v1.worker.gpu.async_utils:AsyncOutput.__init__
+vllm.v1.worker.gpu.async_utils:AsyncOutput.get_output
+
+# --- V1 model runner (vllm/v1/worker/gpu_model_runner.py) ---
+vllm.v1.worker.gpu_model_runner:GPUModelRunner.execute_model
+vllm.v1.worker.gpu_model_runner:GPUModelRunner._update_states
+vllm.v1.worker.gpu_model_runner:GPUModelRunner._prepare_inputs
+vllm.v1.worker.gpu_model_runner:GPUModelRunner._preprocess
+vllm.v1.worker.gpu_model_runner:GPUModelRunner._model_forward
+vllm.v1.worker.gpu_model_runner:GPUModelRunner.sample_tokens
+vllm.v1.worker.gpu_model_runner:GPUModelRunner._sample
+vllm.v1.worker.gpu_model_runner:GPUModelRunner._bookkeeping_sync
+vllm.v1.worker.gpu_model_runner:AsyncGPUModelRunnerOutput.__init__
+vllm.v1.worker.gpu_model_runner:AsyncGPUModelRunnerOutput.get_output

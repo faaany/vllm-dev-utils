@@ -1,5 +1,6 @@
 # Loaded automatically by Python at startup when this directory is on PYTHONPATH.
-# If VLLM_STEP_TIMERS=1, installs step_timers once vLLM's worker module is imported.
+# If VLLM_STEP_TIMERS=1, installs step_timers right after the trigger module is
+# imported (default: vLLM's worker module, which exists only in engine processes).
 import os
 import sys
 
@@ -15,7 +16,7 @@ if os.environ.get("VLLM_STEP_TIMERS") == "1":
     import importlib.abc
     import importlib.util
 
-    _TRIGGER = "vllm.v1.worker.gpu_worker"
+    _TRIGGER = os.environ.get("VLLM_STEP_TIMERS_TRIGGER", "vllm.v1.worker.gpu_worker")
 
     class _InstallAfterImport(importlib.abc.MetaPathFinder):
         def find_spec(self, name, path, target=None):

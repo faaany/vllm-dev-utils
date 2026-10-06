@@ -1,13 +1,27 @@
-"""Wall-clock timers for vLLM's per-step sampling path (model runner V1 and V2).
+"""Wall-clock timers for functions in a running vLLM engine.
 
-Wraps the functions listed in TARGETS. Every VLLM_STEP_TIMERS_EVERY steps
-(default 1000), prints for each function the average time per step and the
-number of calls per step, over the steps since the previous report.
+Wraps the functions listed in a targets file with a stopwatch
+(time.perf_counter). Every N engine steps it prints, for each function, the
+average time per step and the number of calls per step, then resets.
 
-Times are CPU wall-clock (time.perf_counter), with no GPU synchronization
-added. A function that waits for the GPU (e.g. .tolist(), .item(),
-Event.synchronize) includes that waiting time.
-Timings are inclusive: a function's time includes the functions it calls.
+Configuration (environment variables):
+  VLLM_STEP_TIMERS=1                 enable (read by sitecustomize.py)
+  VLLM_STEP_TIMERS_TARGETS=<file>    functions to time, one per line:
+                                       module:function
+                                       module:Class.method
+                                     default: targets/default.txt next to this file
+  VLLM_STEP_TIMERS_ANCHOR=<target>   function called exactly once per engine step;
+                                     defines "per step" and when to report.
+                                     default: vllm.v1.worker.gpu_worker:Worker.sample_tokens
+  VLLM_STEP_TIMERS_EVERY=<n>         report every n steps (default 1000)
+
+Notes:
+  * Times are inclusive (a function's time includes the functions it calls).
+  * No GPU synchronization is added: a function that waits for the GPU
+    (.item(), .tolist(), Event.synchronize, ...) includes that waiting time.
+  * "module:function" wraps the name as seen from that module. To time a
+    function imported with "from x import f", list the module that calls it.
+  * Targets that don't exist are reported as "skipped" and otherwise ignored.
 """
 import collections
 import functools
@@ -16,87 +30,88 @@ import os
 import sys
 import time
 
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
 EVERY = int(os.environ.get("VLLM_STEP_TIMERS_EVERY", "1000"))
-
-# (module, attribute). "Class.method" wraps a method; "name" wraps a module-level
-# function as seen from that module (where it is called from).
-TARGETS = [
-    # Worker level: both runners go through these.
-    ("vllm.v1.worker.gpu_worker", "Worker.execute_model"),
-    ("vllm.v1.worker.gpu_worker", "Worker.sample_tokens"),
-    # Model (same for both runners; V2 calls it inside sample_tokens,
-    # V1 calls it inside execute_model).
-    ("vllm.model_executor.models.deepseek_ocr", "DeepseekOCRForCausalLM.compute_logits"),
-    # --- V2 model runner (vllm/v1/worker/gpu/) ---
-    ("vllm.v1.worker.gpu.model_runner", "GPUModelRunner.sample_tokens"),
-    ("vllm.v1.worker.gpu.model_runner", "GPUModelRunner.sample"),
-    ("vllm.v1.worker.gpu.model_runner", "GPUModelRunner.postprocess_sampled"),
-    ("vllm.v1.worker.gpu.model_runner", "post_update"),
-    ("vllm.v1.worker.gpu.sample.sampler", "Sampler.__call__"),
-    ("vllm.v1.worker.gpu.sample.sampler", "Sampler.sample"),
-    ("vllm.v1.worker.gpu.sample.sampler", "Sampler.apply_sampling_params"),
-    ("vllm.v1.worker.gpu.sample.sampler", "apply_top_k_top_p"),
-    ("vllm.v1.worker.gpu.sample.sampler", "gumbel_sample"),
-    ("vllm.v1.worker.gpu.sample.sampler", "get_num_sampled_and_rejected"),
-    ("vllm.v1.worker.gpu.async_utils", "AsyncOutput.__init__"),
-    ("vllm.v1.worker.gpu.async_utils", "AsyncOutput.get_output"),
-    # --- V1 model runner (vllm/v1/worker/gpu_model_runner.py) ---
-    ("vllm.v1.worker.gpu_model_runner", "GPUModelRunner.sample_tokens"),
-    ("vllm.v1.worker.gpu_model_runner", "GPUModelRunner._sample"),
-    ("vllm.v1.worker.gpu_model_runner", "GPUModelRunner._update_states_after_model_execute"),
-    ("vllm.v1.worker.gpu_model_runner", "GPUModelRunner._bookkeeping_sync"),
-    ("vllm.v1.worker.gpu_model_runner", "AsyncGPUModelRunnerOutput.__init__"),
-    ("vllm.v1.worker.gpu_model_runner", "AsyncGPUModelRunnerOutput.get_output"),
-]
-
-ANCHOR = "gpu_worker:Worker.sample_tokens"  # one call per engine step
+ANCHOR = os.environ.get("VLLM_STEP_TIMERS_ANCHOR",
+                        "vllm.v1.worker.gpu_worker:Worker.sample_tokens")
+TARGETS_FILE = os.environ.get("VLLM_STEP_TIMERS_TARGETS",
+                              os.path.join(_HERE, "targets", "default.txt"))
 
 _time = collections.defaultdict(float)
 _calls = collections.Counter()
+_order = []    # targets in file order, for reports
+_labels = {}   # target -> short label used in reports
 
 
-def _label(module, attr):
-    return f"{module.rsplit('.', 1)[-1]}:{attr}"
+def _log(msg):
+    print(f"[step_timers] {msg}", file=sys.stderr, flush=True)
+
+
+def read_targets(path):
+    targets = []
+    with open(path) as f:
+        for line in f:
+            line = line.split("#", 1)[0].strip()
+            if line and line not in targets:
+                targets.append(line)
+    return targets
+
+
+def _make_labels(targets):
+    """Short labels (last module component + attribute); full name if ambiguous."""
+    short = {t: f"{t.split(':')[0].rsplit('.', 1)[-1]}:{t.split(':', 1)[1]}" for t in targets}
+    counts = collections.Counter(short.values())
+    return {t: (s if counts[s] == 1 else t) for t, s in short.items()}
 
 
 def _report():
     steps = _calls[ANCHOR]
-    lines = [f"[step_timers] pid {os.getpid()}: average over last {steps} steps"
-             " (us per step, calls per step)"]
-    for module, attr in TARGETS:
-        lab = _label(module, attr)
-        if _calls[lab]:
-            lines.append(f"[step_timers]   {_time[lab] / steps * 1e6:9.1f} us"
-                         f"  x{_calls[lab] / steps:4.1f}  {lab}")
-    print("\n".join(lines), file=sys.stderr, flush=True)
+    lines = [f"pid {os.getpid()}: average over last {steps} steps (us per step, calls per step)"]
+    for t in _order:
+        if _calls[t]:
+            lines.append(f"  {_time[t] / steps * 1e6:9.1f} us  x{_calls[t] / steps:4.1f}  {_labels[t]}")
+    _log("\n[step_timers] ".join(lines))
     _time.clear()
     _calls.clear()
 
 
-def _wrap(label, fn):
+def _wrap(target, fn):
     @functools.wraps(fn)
     def timed(*args, **kwargs):
         t0 = time.perf_counter()
         try:
             return fn(*args, **kwargs)
         finally:
-            _time[label] += time.perf_counter() - t0
-            _calls[label] += 1
-            if label == ANCHOR and _calls[label] >= EVERY:
+            _time[target] += time.perf_counter() - t0
+            _calls[target] += 1
+            if target == ANCHOR and _calls[target] >= EVERY:
                 _report()
     return timed
 
 
+def _resolve(target):
+    module, attr = target.split(":", 1)
+    owner = importlib.import_module(module)
+    *path, name = attr.split(".")
+    for part in path:
+        owner = getattr(owner, part)
+    return owner, name
+
+
 def install():
-    for module, attr in TARGETS:
+    targets = read_targets(TARGETS_FILE)
+    if ANCHOR not in targets:
+        targets.insert(0, ANCHOR)
+    _labels.update(_make_labels(targets))
+    for target in targets:
         try:
-            mod = importlib.import_module(module)
-            owner, name = mod, attr
-            if "." in attr:
-                cls, name = attr.split(".", 1)
-                owner = getattr(mod, cls)
-            setattr(owner, name, _wrap(_label(module, attr), getattr(owner, name)))
+            owner, name = _resolve(target)
+            setattr(owner, name, _wrap(target, getattr(owner, name)))
+            _order.append(target)
         except Exception as e:  # missing in this vLLM version: skip, don't break vLLM
-            print(f"[step_timers] skipped {module}:{attr}: {e!r}", file=sys.stderr, flush=True)
-    print(f"[step_timers] installed in pid {os.getpid()}, reporting every {EVERY} steps",
-          file=sys.stderr, flush=True)
+            _log(f"skipped {target}: {e!r}")
+    if ANCHOR not in _order:
+        _log(f"anchor {ANCHOR} could not be wrapped: no reports will be printed")
+    _log(f"installed in pid {os.getpid()}: {len(_order)} targets from {TARGETS_FILE}, "
+         f"anchor {_labels.get(ANCHOR, ANCHOR)}, reporting every {EVERY} steps")

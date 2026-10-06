@@ -1,0 +1,6 @@
+# Functions to time, one per line: module:function or module:Class.method
+# Lines starting with # are comments. Missing targets are skipped with a message.
+
+# Worker level: one call each per engine step, for both model runners.
+vllm.v1.worker.gpu_worker:Worker.execute_model
+vllm.v1.worker.gpu_worker:Worker.sample_tokens
