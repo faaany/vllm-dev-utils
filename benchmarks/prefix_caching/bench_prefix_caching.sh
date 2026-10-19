@@ -4,8 +4,8 @@
 # Daily -- PC gain on the fixed workload (4096-token shared prefix + 512 unique
 # tokens, concurrency 16, plus a cheap concurrency-1 point that isolates the
 # cache-hit path):
-#   MODES="on off" TP="2" ./bench_prefix_caching.sh Qwen/Qwen3-14B tiiuae/falcon-mamba-7b
-#   MODES="on off" TP="4" ./bench_prefix_caching.sh Qwen/Qwen3.8-27B Qwen/Qwen3.6-35B-A3B
+#   MODES="on off" TP="2" ./bench_prefix_caching.sh Qwen/Qwen3-14B deepseek-ai/DeepSeek-V2-Lite
+#   MODES="on off" TP="4" ./bench_prefix_caching.sh Qwen/Qwen3.8-27B Qwen/Qwen3.6-35B-A3B openai/gpt-oss-20b nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
 # Curve -- PC gain vs. hit ratio (~0/25/50/75/89%; prefix 0 = nothing reused,
 # i.e. PC's overhead). Once per platform on one representative model, ~5x the
 # daily run time:
