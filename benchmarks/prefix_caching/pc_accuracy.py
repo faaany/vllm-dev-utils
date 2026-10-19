@@ -100,7 +100,8 @@ def build_prompts(base, model, corpus, lengths, num_prefixes):
         sys.exit(f"corpus has {len(ids)} tokens, need {windows * max(lengths)}")
     bos = tokenize(base, model, "", special=True)  # [] or [bos], per tokenizer
     questions = [tokenize(base, model, q, special=False) for q in QUESTIONS]
-    prompts = [(length, bos + ids[w * stride:w * stride + length])
+    # The BOS counts toward the length, so 4096 stays block-aligned with it.
+    prompts = [(length, bos + ids[w * stride:w * stride + length - len(bos)])
                for w, length in enumerate(l for l in lengths for _ in range(num_prefixes))]
     return prompts, ids, questions
 
