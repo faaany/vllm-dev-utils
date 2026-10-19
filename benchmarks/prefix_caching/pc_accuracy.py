@@ -30,12 +30,13 @@ short questions, so the model is confident and greedy decoding is stable.
 Random-token prompts are useless here: their logits are near-flat and a 1e-3
 numeric wobble flips the first token even with plain attention.
 
-A divergence is classified with the reference's top logprobs at that step:
-  tie      - the hit's token was within --tie-margin of the reference's top-1,
-             i.e. numeric noise picked the other side of a near-tie
-  MISMATCH - the hit chose a token the reference clearly did not
-Logprobs come back bf16-quantized (steps of 0.0625-0.125 around -1), so a
-one-ulp gap of 0.125 is still a tie; the default margin is ~4 ulps.
+A divergence is judged at the first differing token, as vLLM's own
+check_logprobs_close (tests/models/utils.py) does:
+  close    - each side's token is in the other's top-TOP_K logprobs, i.e. both
+             runs saw it as a likely candidate and numeric noise tipped greedy
+  MISMATCH - either token is missing from the other side's top-TOP_K
+margin (the reference's top-1 logprob minus the hit token's) and first_dlp are
+kept for diagnosis only; they do not affect the verdict.
 first_dlp is |logprob(hit) - logprob(ref)| of the reference's first token: the
 first decode step reads the restored cache state directly, so it is the most
 direct measure of whether that state is right. Healthy runs stay well under
@@ -62,6 +63,8 @@ QUESTIONS = [
     "\n\nQuestion: Who is the intended reader of the text above?\nAnswer:",
     "\n\nQuestion: Suggest a short title for the text above.\nAnswer:",
 ]
+# Logprobs per step; vLLM's tests use 5 (num_logprobs) with check_logprobs_close.
+TOP_K = 5
 
 
 def post(base, path, payload):
@@ -108,7 +111,7 @@ def build_prompts(base, model, corpus, lengths, num_prefixes):
 
 def complete(base, model, prompt, max_tokens, skip_cache):
     payload = {"model": model, "prompt": prompt, "max_tokens": max_tokens,
-               "temperature": 0, "ignore_eos": True, "logprobs": 5,
+               "temperature": 0, "ignore_eos": True, "logprobs": TOP_K,
                "return_tokens_as_token_ids": True}
     if skip_cache:
         payload["prompt_logprobs"] = 0
@@ -119,16 +122,20 @@ def complete(base, model, prompt, max_tokens, skip_cache):
             "top": lp["top_logprobs"], "cached": details.get("cached_tokens")}
 
 
-def classify(hit, ref, tie_margin):
+def classify(hit, ref):
+    """(verdict, diverge_at, first_dlp, margin, hit_top, ref_top); the top-k
+    dicts are those at the divergence, kept so a verdict can be rechecked."""
     t0 = ref["tokens"][0]
     first_dlp = abs(hit["top"][0].get(t0, -math.inf) - ref["top"][0][t0])
     k = next((i for i, (a, b) in enumerate(zip(hit["tokens"], ref["tokens"]))
               if a != b), None)
     if k is None:
-        return "same", None, first_dlp, None
-    top = ref["top"][k]
-    margin = top[ref["tokens"][k]] - top.get(hit["tokens"][k], -math.inf)
-    return ("tie" if margin < tie_margin else "MISMATCH"), k, first_dlp, margin
+        return "same", None, first_dlp, None, None, None
+    hit_top, ref_top = hit["top"][k], ref["top"][k]
+    hit_tok, ref_tok = hit["tokens"][k], ref["tokens"][k]
+    margin = ref_top[ref_tok] - ref_top.get(hit_tok, -math.inf)
+    close = hit_tok in ref_top and ref_tok in hit_top
+    return ("close" if close else "MISMATCH"), k, first_dlp, margin, hit_top, ref_top
 
 
 def kv_capacity(base):
@@ -187,7 +194,7 @@ def summarize(results, evict, dlp_warn):
     # self-check that the probe's two paths agree when neither reads the cache.
     tested = [r for r in results if r["cached_tokens"] or r["phase"] == "evicted"]
     tested = tested if hits else results
-    count = {v: sum(r["verdict"] == v for r in tested) for v in ("same", "tie", "MISMATCH")}
+    count = {v: sum(r["verdict"] == v for r in tested) for v in ("same", "close", "MISMATCH")}
     max_dlp = max((r["first_dlp"] for r in tested), default=0.0)
     siblings = [r for r in known if not r["repeat"]]
     sibling_hits = [r for r in siblings if r["cached_tokens"] > 0]
@@ -215,7 +222,7 @@ def summarize(results, evict, dlp_warn):
     conc = [r for r in results if r["phase"] == "conc"]
     phases = f"  conc {sum(r['verdict'] != 'MISMATCH' for r in conc)}/{len(conc)} ok" if conc else ""
     phases += f"  evict: {evict}" if evict else ""
-    return verdict, (f"{verdict}  {hit_info}  {scope}same {count['same']} tie {count['tie']} "
+    return verdict, (f"{verdict}  {hit_info}  {scope}same {count['same']} close {count['close']} "
                      f"mismatch {count['MISMATCH']}  max-first-dlp {max_dlp:.3f}{phases}")
 
 
@@ -235,8 +242,6 @@ def main():
                     help="shared-prefix lengths; keep one that no block size divides")
     ap.add_argument("--num-prefixes", type=int, default=3, help="distinct prefixes per length")
     ap.add_argument("--max-tokens", type=int, default=32)
-    ap.add_argument("--tie-margin", type=float, default=0.5,
-                    help="logprob gap below which a divergence counts as a tie")
     ap.add_argument("--dlp-warn", type=float, default=0.25,
                     help="warn when the first token's logprob moves more than this")
     ap.add_argument("--concurrent", action="store_true", help="also run the concurrent phase")
@@ -257,7 +262,7 @@ def main():
     def check(p, qi, phase, hit):
         length, prefix = prompts[p]
         ref = refs[p, qi]
-        verdict, div_at, first_dlp, margin = classify(hit, ref, args.tie_margin)
+        verdict, div_at, first_dlp, margin, hit_top, ref_top = classify(hit, ref)
         results.append({"prefix": p, "length": length, "question": qi, "phase": phase,
                         "prompt_len": len(prefix) + len(questions[qi]),
                         # q0/q1 repeat a warm-up prompt verbatim (replay-boundary
@@ -266,6 +271,7 @@ def main():
                         "cached_tokens": hit["cached"], "ref_cached_tokens": ref["cached"],
                         "verdict": verdict, "diverge_at": div_at,
                         "first_dlp": first_dlp, "margin": margin,
+                        "hit_top": hit_top, "ref_top": ref_top,
                         "hit_text": hit["text"], "ref_text": ref["text"]})
 
     for p, (length, prefix) in enumerate(prompts):
