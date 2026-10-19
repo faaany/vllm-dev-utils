@@ -19,7 +19,8 @@
 #
 # Other knobs (env vars, combine freely):
 #   EXEC_MODE=eager             --enforce-eager instead of graph mode (default)
-#   RETENTION=0                 sparse Mamba/sliding-window checkpoint retention
+#   RETENTION=None              dense Mamba/sliding-window checkpoint retention
+#                               (old behavior; default leaves vLLM's own, 0)
 #   CONCURRENCIES="1 4 16 32"   load sweep
 #   REPEATS=3                   rerun each point, to tell a small gap from noise
 #   EXTRA_SERVER_ARGS="--kv-cache-dtype fp8" TAG=fp8kv
@@ -64,9 +65,11 @@ server_numa=(); [[ -n "$SERVER_NUMA" ]] && server_numa=(numactl --cpunodebind="$
 client_numa=(); [[ -n "$CLIENT_NUMA" ]] && client_numa=(numactl --cpunodebind="$CLIENT_NUMA" --membind="$CLIENT_NUMA")
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-8192}
 MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-8192}
-# Mamba/sliding-window checkpoint retention: None = dense (old behavior),
-# 0 = junctions/replay boundary only (upstream default), N = every N tokens.
-RETENTION=${RETENTION:-None}
+# Mamba/sliding-window checkpoint retention: empty = vLLM's default (0 =
+# junctions/replay boundary only), None = dense (old behavior), N = every N
+# tokens.
+RETENTION=${RETENTION:-}
+retention_flag=(); [[ -n "$RETENTION" ]] && retention_flag=(--prefix-cache-retention-interval "$RETENTION")
 # Folder of .md prose the accuracy probe cuts prompts from; empty = probe's
 # default (/workspace/vllm/docs, else <script dir>/workspace/vllm/docs).
 PROBE_CORPUS=${PROBE_CORPUS:-}
@@ -150,8 +153,7 @@ esac
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # Non-default retention and tagged configs get their own tree, so they never
 # overwrite the default results.
-ret_suffix=""; [[ "$RETENTION" != "None" ]] && ret_suffix="_ret$RETENTION"
-OUTROOT=${OUTDIR:-"$SCRIPT_DIR/pc_bench_results_$EXEC_MODE/$PLATFORM$ret_suffix${TAG:+_$TAG}"}
+OUTROOT=${OUTDIR:-"$SCRIPT_DIR/pc_bench_results_$EXEC_MODE/$PLATFORM${RETENTION:+_ret$RETENTION}${TAG:+_$TAG}"}
 mkdir -p "$OUTROOT"
 
 SERVER_PID=""
@@ -196,14 +198,14 @@ start_server() {
     off) pc_flag="--no-enable-prefix-caching" ;;
   esac
 
-  echo "== launching $model on $PLATFORM ($EXEC_MODE, prefix caching: $mode, retention $RETENTION${TAG:+, tag $TAG}) cards $CARDS =="
+  echo "== launching $model on $PLATFORM ($EXEC_MODE, prefix caching: $mode, retention ${RETENTION:-default}${TAG:+, tag $TAG}) cards $CARDS =="
   # setsid so the whole engine/worker tree lands in one process group we can
   # reap; killing only the `vllm serve` parent leaves VLLM::EngineCore and
   # VLLM::Worker_TP* alive, still holding all the device memory.
   # EXTRA_SERVER_ARGS and model_args are left unquoted on purpose: they hold
   # several flags.
   local server_args=(vllm serve "$model"
-      $exec_flag --prefix-cache-retention-interval "$RETENTION" --host 0.0.0.0 --port "$PORT"
+      $exec_flag "${retention_flag[@]}" --host 0.0.0.0 --port "$PORT"
       --enable-prompt-tokens-details --trust-remote-code --tensor-parallel-size "$TP"
       --max-model-len "$MAX_MODEL_LEN" --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS"
       $pc_flag $(model_args "$model") $EXTRA_SERVER_ARGS)
@@ -302,7 +304,7 @@ write_meta() {
     --out "$outdir/run_meta_$mode.json" --log "$outdir/server_$mode.log" \
     --metrics "$outdir/cache_config_$mode.txt" \
     --field model="$model" --field pc_mode="$mode" --field status="$status" \
-    --field platform="$PLATFORM" --field exec_mode="$EXEC_MODE" --field retention="$RETENTION" \
+    --field platform="$PLATFORM" --field exec_mode="$EXEC_MODE" --field retention="${RETENTION:-default}" \
     --field tag="$TAG" --field extra_server_args="$EXTRA_SERVER_ARGS" \
     --field cards="$CARDS" --field tp="$TP" --field max_model_len="$MAX_MODEL_LEN" \
     --field server_numa="$SERVER_NUMA" --field client_numa="$CLIENT_NUMA" \
