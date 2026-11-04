@@ -49,8 +49,15 @@ def main():
     ap.add_argument("--tokens", default="64,256,2048,8192", help="tokens per rank")
     ap.add_argument("--iters", type=int, default=50)
     ap.add_argument("--warmup", type=int, default=10)
+    ap.add_argument("--ccl-local", action="store_true",
+                    help="tell oneCCL the local rank / size from torchrun's variables; without it, "
+                         "oneCCL warns it cannot find them and asks its OFI transport instead")
     args = ap.parse_args()
 
+    if args.ccl_local:
+        os.environ["CCL_PROCESS_LAUNCHER"] = "none"
+        os.environ["CCL_LOCAL_RANK"] = os.environ["LOCAL_RANK"]
+        os.environ["CCL_LOCAL_SIZE"] = os.environ["LOCAL_WORLD_SIZE"]
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.xpu.set_device(local_rank)
     dist.init_process_group("xccl")
