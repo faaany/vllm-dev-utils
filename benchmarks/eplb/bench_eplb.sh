@@ -4,6 +4,7 @@
 #
 #   GPU=cri PHASE=decode ./bench_eplb.sh [model]
 #   GPU=b70 PHASE=prefill MODES="fake_off on" ./bench_eplb.sh
+#   GPU=b70 PHASE=decode SMOKE=1 ./bench_eplb.sh    # short check before a real run
 #
 # Modes (all use expert parallel, so they differ only in EPLB):
 #   off       no EPLB
@@ -15,11 +16,14 @@ MODEL=${1:-Qwen/Qwen3-30B-A3B}
 GPU=${GPU:-cri}            # cri | b70, only names the result folder for now
 PHASE=${PHASE:-decode}     # decode | prefill
 MODES=${MODES:-"off fake_off on"}
+SMOKE=${SMOKE:-0}          # 1: same server settings, fewer steps
 
 # ---------------- settings (vLLM defaults where there is one) ----------------
 CARDS=0,1,2,3,4,5,6,7
 DP=8
 MNBT=8192                  # max_num_batched_tokens
+GPU_MEM_UTIL=0.89          # not the default 0.92: DP starts DP API servers, which hold
+                           # ~2.9 GiB on xpu:0 together; B70 30.3 GiB -> at most 0.90
 STEP_INTERVAL=3000         # EPLB: rearrange every N engine steps
 WINDOW=1000                # EPLB: load statistics over the last N steps
 REDUNDANT=8                # EPLB: redundant experts, 1 per rank
@@ -40,10 +44,22 @@ case "$PHASE" in
   *)       echo "PHASE must be decode|prefill, got '$PHASE'"; exit 1 ;;
 esac
 
+# Smoke: server settings (CONC, OUTPUT_LEN, MNBT, ...) stay as above, so KV and
+# memory problems still show; only the interval and step counts shrink.
+if [[ "$SMOKE" == 1 ]]; then
+  case "$PHASE" in
+    decode)  STEP_INTERVAL=1000; PRIME_STEPS=1010; MEASURE_STEPS=500 ;;   # 2 + 1 batches of 512 steps
+    prefill) STEP_INTERVAL=100;  PRIME_STEPS=110;  MEASURE_STEPS=50  ;;
+  esac
+  WINDOW=$STEP_INTERVAL
+fi
+
 # steps_to_prompts <steps>: how many requests keep the server busy that long.
 steps_to_prompts() {
   if [[ "$PHASE" == decode ]]; then
-    echo $(( ($1 + OUTPUT_LEN - 1) / OUTPUT_LEN * CONC * DP ))
+    # a batch is CONC x DP requests running OUTPUT_LEN steps side by side
+    local batches=$(( ($1 + OUTPUT_LEN - 1) / OUTPUT_LEN ))   # ceil(steps / OUTPUT_LEN)
+    echo $(( batches * CONC * DP ))
   else
     echo $(( $1 * DP * MNBT / PROMPT_LEN ))
   fi
@@ -53,7 +69,7 @@ MEASURE_PROMPTS=$(steps_to_prompts $MEASURE_STEPS)
 # -----------------------------------------------------------------------------
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-OUT_DIR=$SCRIPT_DIR/eplb_bench_results/${GPU}_${PHASE}_$(date +%m%d_%H%M)
+OUT_DIR=$SCRIPT_DIR/eplb_bench_results/${GPU}_${PHASE}$([[ "$SMOKE" == 1 ]] && echo _smoke)_$(date +%m%d_%H%M)
 mkdir -p "$OUT_DIR"
 
 # GSM8K test set as 5-shot prompts, built like vLLM's tests/evals/gsm8k/gsm8k_eval.py.
@@ -76,7 +92,7 @@ os.replace(sys.argv[1] + ".tmp", sys.argv[1])
 EOF
 fi
 
-echo "== $GPU $PHASE, modes: $MODES"
+echo "== $GPU $PHASE$([[ "$SMOKE" == 1 ]] && echo " SMOKE"), modes: $MODES"
 echo "   DP$DP, conc $CONC/rank, mnbt $MNBT, output $OUTPUT_LEN, interval $STEP_INTERVAL"
 echo "   prime $PRIME_PROMPTS prompts (~$PRIME_STEPS steps), measure $MEASURE_PROMPTS prompts (~$MEASURE_STEPS steps)"
 echo "   -> $OUT_DIR"
@@ -104,7 +120,7 @@ start_server() {
   local mode=$1 log="$OUT_DIR/server_$1.log"
   # shellcheck disable=SC2046  # eplb_args is split on purpose; its JSON has no spaces
   setsid env PYTHONUNBUFFERED=1 ZE_AFFINITY_MASK=$CARDS vllm serve "$MODEL" \
-    --host 0.0.0.0 --port 9999 \
+    --host 0.0.0.0 --port 9999 --gpu-memory-utilization $GPU_MEM_UTIL \
     --data-parallel-size $DP --enable-expert-parallel $(eplb_args "$mode") $PREFIX_CACHING \
     --max-num-batched-tokens $MNBT --max-num-seqs $MAX_NUM_SEQS --max-model-len 2048 \
     > "$log" 2>&1 &
@@ -129,10 +145,14 @@ send_requests() {
     > "$OUT_DIR/client_$1_$2.log" 2>&1
 }
 
+PROBLEMS=0
+warn() { echo "WARN: $*" | tee -a "$OUT_DIR/problems.txt"; PROBLEMS=$((PROBLEMS + 1)); }
+
 prime() {
   send_requests "$1" prime $PRIME_PROMPTS
-  if [[ "$1" == on ]] && ! grep -qE "Rearranged experts|Skip rearrange" "$OUT_DIR/server_on.log"; then
-    echo "WARN: on: no rearrangement during priming"
+  # "Rearranged experts   in" is a real one; the startup one reads "Rearranged experts  (profile)  in".
+  if [[ "$1" == on ]] && ! grep -qE "Rearranged experts +in |Skip rearrange" "$OUT_DIR/server_on.log"; then
+    warn "on: no rearrangement during priming"
   fi
 }
 
@@ -142,6 +162,25 @@ measure() {
   size=$(stat -c %s "$log")
   send_requests "$1" measure $MEASURE_PROMPTS
   tail -c +$((size + 1)) "$log" > "$OUT_DIR/server_$1_measure.log"
+}
+
+# health <mode>: problems the summary table would hide. Call while the server is up.
+health() {
+  local log="$OUT_DIR/server_$1.log" kv preempt slow_all slow errors
+  kv=$(grep -o 'KV cache size: [0-9,]* tokens' "$log" | tr -d , | awk '{print $4}' | sort -n | head -1 || true)
+  preempt=$(curl -s -m 5 http://0.0.0.0:9999/metrics \
+            | awk '/^vllm:num_preemptions_total/ {s += $NF} END {printf "%d", s}' || true)
+  # "No available shared memory broadcast block": one step took > 60 s. All DP engines
+  # log it at once, so count distinct timestamps. First steps (kernel JIT) are expected.
+  slow_all=$(grep 'No available shared memory broadcast' "$log" | grep -oE '[0-9]{2}:[0-9]{2}:[0-9]{2}' | sort -u | wc -l)
+  slow=$(grep 'No available shared memory broadcast' "$OUT_DIR/server_$1_measure.log" 2>/dev/null \
+         | grep -oE '[0-9]{2}:[0-9]{2}:[0-9]{2}' | sort -u | wc -l || true)
+  errors=$(grep -cE 'Traceback|^\S* *ERROR | ERROR [0-9-]+ ' "$log" || true)
+  echo "   $1 health: KV ${kv:-?} tokens/rank (min), preempted ${preempt:-?}," \
+       "steps > 60 s: $slow_all ($slow while measuring), error lines $errors" | tee -a "$OUT_DIR/health.txt"
+  (( ${preempt:-0} == 0 )) || warn "$1: $preempt requests preempted: KV cache too small for CONC $CONC"
+  (( ${slow:-0} == 0 ))    || warn "$1: a step took > 60 s while measuring"
+  (( errors == 0 ))        || warn "$1: $errors error lines in $log"
 }
 
 analyze() {
@@ -169,17 +208,41 @@ for m, r in rows.items():
     print(f"{m:9} {r['b']:>5} {r['tps']:>10.0f} {rel:>7} {r['ttft']:>9.1f} {r['itl']:>8.2f} {r['stall']:>7.1f}")
 print("b: mean balancedness while measuring. base: fake_off (else off). "
       "stall: rearrangement time while measuring, should be 0. ITL is the mean, not the median.")
+for m in modes:
+    if m not in rows:
+        print(f"WARN: {m}: no measurement")
+    elif rows[m]["stall"] > 0:
+        print(f"WARN: {m}: a rearrangement fell inside the measured window")
 EOF
 }
 
+# timed <label> <command...>: run it, then print and log how long it took.
+timed() {
+  local label=$1 t0=$SECONDS rc=0; shift
+  "$@" || rc=$?
+  local s=$((SECONDS - t0))
+  printf '   %-16s %3dm%02ds\n' "$label" $((s / 60)) $((s % 60)) | tee -a "$OUT_DIR/timing.txt"
+  return $rc
+}
+
 for mode in $MODES; do
-  if ! start_server "$mode"; then
-    echo "WARN: $mode: server failed to start"
-  elif ! prime "$mode"; then
-    echo "WARN: $mode: priming failed, see $OUT_DIR/client_${mode}_prime.log"
-  elif ! measure "$mode"; then
-    echo "WARN: $mode: measuring failed, see $OUT_DIR/client_${mode}_measure.log"
+  if ! timed "$mode start" start_server "$mode"; then
+    warn "$mode: server failed to start, see $OUT_DIR/server_$mode.log"
+  else
+    if ! timed "$mode prime" prime "$mode"; then
+      warn "$mode: priming failed, see $OUT_DIR/client_${mode}_prime.log"
+    elif ! timed "$mode measure" measure "$mode"; then
+      warn "$mode: measuring failed, see $OUT_DIR/client_${mode}_measure.log"
+    fi
+    health "$mode"
   fi
   stop_server
 done
 analyze
+PROBLEMS=$((PROBLEMS + $(grep -c '^WARN' "$OUT_DIR/summary.txt" || true)))
+printf '== total %dm%02ds\n' $((SECONDS / 60)) $((SECONDS % 60)) | tee -a "$OUT_DIR/timing.txt"
+if (( PROBLEMS )); then
+  echo "== $([[ "$SMOKE" == 1 ]] && echo "SMOKE FAILED: ")$PROBLEMS problem(s), see the WARN lines"
+else
+  echo "== $([[ "$SMOKE" == 1 ]] && echo "SMOKE PASSED: ")no problems found"
+fi
