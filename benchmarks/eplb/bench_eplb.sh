@@ -6,6 +6,8 @@
 #   PHASE=prefill MODES="fake_off on" ./bench_eplb.sh
 #   PHASE=decode SMOKE=1 ./bench_eplb.sh            # short check before a real run
 #   CONC=128 MNBT=4096 SMOKE=1 MODES=off ./bench_eplb.sh   # CONC is per rank
+#   CARDS=0,1,2,3 PORT=9999 PHASE=prefill ./bench_eplb.sh &  # two DEP4 servers side by side,
+#   CARDS=4,5,6,7 PORT=9998 PHASE=prefill ./bench_eplb.sh &  # one per CPU socket
 #
 # Modes (all use expert parallel, so they differ only in EPLB):
 #   off       no EPLB
@@ -19,8 +21,10 @@ MODES=${MODES:-"off fake_off on"}
 SMOKE=${SMOKE:-0}          # 1: same server settings, fewer steps
 
 # ---------------- settings (vLLM defaults where there is one) ----------------
-CARDS=0,1,2,3,4,5,6,7
-DP=8
+CARDS=${CARDS:-0,1,2,3,4,5,6,7}
+DP=${DP:-$(echo "$CARDS" | tr ',' '\n' | wc -l)}   # one rank per card (TP=1)
+PORT=${PORT:-9999}
+BENCH_TIMEOUT=${BENCH_TIMEOUT:-5400}   # seconds per bench call: a hung server fails the point, not the night
 MNBT=${MNBT:-2048}         # max_num_batched_tokens: vLLM's default on cards < 70 GB. Passed
                            # explicitly, since the prefill step count below depends on it.
                            # (B70: 8192 with decode CONC 256 hung the engines, 2026-11-04.)
@@ -28,7 +32,7 @@ GPU_MEM_UTIL=0.89          # not the default 0.92: DP starts DP API servers, whi
                            # ~2.9 GiB on xpu:0 together; B70 30.3 GiB -> at most 0.90
 STEP_INTERVAL=3000         # EPLB: rearrange every N engine steps
 WINDOW=1000                # EPLB: load statistics over the last N steps
-REDUNDANT=8                # EPLB: redundant experts, 1 per rank
+REDUNDANT=$DP              # EPLB: redundant experts, 1 per rank
 PROMPT_LEN=723             # mean tokens of a prompt in data/gsm8k_5shot.jsonl (measured)
 
 # vLLM starts the rearrangement counter at 3/4 of the interval (eplb_state.py), so
@@ -75,16 +79,27 @@ MEASURE_PROMPTS=$(steps_to_prompts $MEASURE_STEPS)
 # -----------------------------------------------------------------------------
 
 # A vllm left over from an earlier run (killed with -9, closed session) still
-# holds the cards; refuse to start next to it.
-# Matched on the process name: "vllm" for the server, "VLLM::..." for its engines and workers.
-if leftover=$(pgrep -d, -u "$(id -u)" '^(vllm|VLLM::)'); then
-  echo "leftover vllm processes of yours, stop them first:"
-  ps -o pid,etime,cmd -p "$leftover" | cut -c1-150
+# holds the cards; refuse to start next to one on any of our cards, or on our port.
+# Matched on the process name ("vllm" for the server, "VLLM::..." for its engines and
+# workers) and on the ZE_AFFINITY_MASK it was started with (none = all cards).
+leftover=""
+for pid in $(pgrep -u "$(id -u)" '^(vllm|VLLM::)' || true); do
+  mask=$(tr '\0' '\n' < /proc/$pid/environ 2>/dev/null | sed -n 's/^ZE_AFFINITY_MASK=//p' || true)
+  for c in ${CARDS//,/ }; do
+    if [[ -z "$mask" || ",$mask," == *",$c,"* ]]; then leftover+="$pid,"; break; fi
+  done
+done
+if [[ -n "$leftover" ]]; then
+  echo "vllm processes of yours on cards $CARDS, stop them first:"
+  ps -o pid,etime,cmd -p "${leftover%,}" | cut -c1-150
   exit 1
+fi
+if curl -s -m 2 "http://0.0.0.0:$PORT/health" > /dev/null; then
+  echo "port $PORT is already serving, pick another PORT"; exit 1
 fi
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-OUT_DIR=$SCRIPT_DIR/eplb_bench_results/${PHASE}$([[ "$SMOKE" == 1 ]] && echo _smoke)_$(date +%m%d_%H%M)
+OUT_DIR=${OUT_DIR:-$SCRIPT_DIR/eplb_bench_results/${PHASE}$([[ "$SMOKE" == 1 ]] && echo _smoke)_dp${DP}_gpu${CARDS//,/}_$(date +%m%d_%H%M)}
 mkdir -p "$OUT_DIR"
 
 # GSM8K test set as 5-shot prompts, built like vLLM's tests/evals/gsm8k/gsm8k_eval.py.
@@ -108,7 +123,7 @@ EOF
 fi
 
 echo "== $PHASE$([[ "$SMOKE" == 1 ]] && echo " SMOKE"), modes: $MODES"
-echo "   DP$DP, conc $CONC/rank, mnbt $MNBT, output $OUTPUT_LEN, interval $STEP_INTERVAL"
+echo "   DP$DP on cards $CARDS (port $PORT), conc $CONC/rank, mnbt $MNBT, output $OUTPUT_LEN, interval $STEP_INTERVAL"
 echo "   prime $PRIME_PROMPTS prompts (~$PRIME_STEPS steps), measure $MEASURE_PROMPTS prompts (~$MEASURE_STEPS steps)"
 echo "   -> $OUT_DIR"
 
@@ -143,7 +158,7 @@ start_server() {
   local mode=$1 log="$OUT_DIR/server_$1.log"
   # shellcheck disable=SC2046  # eplb_args is split on purpose; its JSON has no spaces
   setsid env PYTHONUNBUFFERED=1 ZE_AFFINITY_MASK=$CARDS vllm serve "$MODEL" \
-    --host 0.0.0.0 --port 9999 --gpu-memory-utilization $GPU_MEM_UTIL \
+    --host 0.0.0.0 --port $PORT --gpu-memory-utilization $GPU_MEM_UTIL \
     --data-parallel-size $DP --enable-expert-parallel $(eplb_args "$mode") $PREFIX_CACHING \
     --max-num-batched-tokens $MNBT \
     > "$log" 2>&1 &
@@ -151,7 +166,7 @@ start_server() {
 
   echo -n "waiting for server ($mode)"
   for i in $(seq 1 240); do
-    curl -s -m 2 http://0.0.0.0:9999/health > /dev/null && { echo " ready"; return 0; }
+    curl -s -m 2 "http://0.0.0.0:$PORT/health" > /dev/null && { echo " ready"; return 0; }
     kill -0 "$SERVER_PID" 2>/dev/null || { echo " DIED"; tail -40 "$log"; return 1; }
     sleep 5; echo -n "."
   done
@@ -162,7 +177,7 @@ start_server() {
 # --ready-check-timeout-sec 0 skips bench's initial single-request test run: with
 # --ignore-eos it alone runs OUTPUT_LEN steps, which count toward the EPLB interval.
 send_requests() {
-  vllm bench serve --model "$MODEL" --host 0.0.0.0 --port 9999 --ready-check-timeout-sec 0 \
+  timeout "$BENCH_TIMEOUT" vllm bench serve --model "$MODEL" --host 0.0.0.0 --port "$PORT" --ready-check-timeout-sec 0 \
     --dataset-name custom --dataset-path "$DATASET" --skip-chat-template \
     --custom-output-len $OUTPUT_LEN --ignore-eos \
     --num-prompts "$3" --request-rate inf --max-concurrency $((CONC * DP)) \
@@ -193,11 +208,11 @@ measure() {
 health() {
   local log="$OUT_DIR/server_$1.log" kv preempt slow_all slow errors
   kv=$(grep -o 'KV cache size: [0-9,]* tokens' "$log" | tr -d , | awk '{print $4}' | sort -n | head -1 || true)
-  preempt=$(curl -s -m 5 http://0.0.0.0:9999/metrics \
+  preempt=$(curl -s -m 5 "http://0.0.0.0:$PORT/metrics" \
             | awk '/^vllm:num_preemptions_total/ {s += $NF} END {printf "%d", s}' || true)
   # "No available shared memory broadcast block": one step took > 60 s. All DP engines
   # log it at once, so count distinct timestamps. First steps (kernel JIT) are expected.
-  slow_all=$(grep 'No available shared memory broadcast' "$log" | grep -oE '[0-9]{2}:[0-9]{2}:[0-9]{2}' | sort -u | wc -l)
+  slow_all=$(grep 'No available shared memory broadcast' "$log" | grep -oE '[0-9]{2}:[0-9]{2}:[0-9]{2}' | sort -u | wc -l || true)
   slow=$(grep 'No available shared memory broadcast' "$OUT_DIR/server_$1_measure.log" 2>/dev/null \
          | grep -oE '[0-9]{2}:[0-9]{2}:[0-9]{2}' | sort -u | wc -l || true)
   errors=$(grep -cE 'Traceback|^\S* *ERROR | ERROR [0-9-]+ ' "$log" || true)
