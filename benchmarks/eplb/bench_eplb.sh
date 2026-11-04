@@ -2,9 +2,10 @@
 # EPLB benchmark: for each mode, start a server, prime it past the first
 # expert rearrangement, then measure.
 #
-#   GPU=cri PHASE=decode ./bench_eplb.sh [model]
-#   GPU=b70 PHASE=prefill MODES="fake_off on" ./bench_eplb.sh
-#   GPU=b70 PHASE=decode SMOKE=1 ./bench_eplb.sh    # short check before a real run
+#   PHASE=decode ./bench_eplb.sh [model]
+#   PHASE=prefill MODES="fake_off on" ./bench_eplb.sh
+#   PHASE=decode SMOKE=1 ./bench_eplb.sh            # short check before a real run
+#   CONC=128 MNBT=4096 SMOKE=1 MODES=off ./bench_eplb.sh   # CONC is per rank
 #
 # Modes (all use expert parallel, so they differ only in EPLB):
 #   off       no EPLB
@@ -13,7 +14,6 @@
 set -euo pipefail
 
 MODEL=${1:-Qwen/Qwen3-30B-A3B}
-GPU=${GPU:-cri}            # cri | b70, only names the result folder for now
 PHASE=${PHASE:-decode}     # decode | prefill
 MODES=${MODES:-"off fake_off on"}
 SMOKE=${SMOKE:-0}          # 1: same server settings, fewer steps
@@ -21,7 +21,9 @@ SMOKE=${SMOKE:-0}          # 1: same server settings, fewer steps
 # ---------------- settings (vLLM defaults where there is one) ----------------
 CARDS=0,1,2,3,4,5,6,7
 DP=8
-MNBT=8192                  # max_num_batched_tokens
+MNBT=${MNBT:-2048}         # max_num_batched_tokens: vLLM's default on cards < 70 GB. Passed
+                           # explicitly, since the prefill step count below depends on it.
+                           # (B70: 8192 with decode CONC 256 hung the engines, 2026-11-04.)
 GPU_MEM_UTIL=0.89          # not the default 0.92: DP starts DP API servers, which hold
                            # ~2.9 GiB on xpu:0 together; B70 30.3 GiB -> at most 0.90
 STEP_INTERVAL=3000         # EPLB: rearrange every N engine steps
@@ -29,18 +31,20 @@ WINDOW=1000                # EPLB: load statistics over the last N steps
 REDUNDANT=8                # EPLB: redundant experts, 1 per rank
 PROMPT_LEN=723             # mean tokens of a prompt in data/gsm8k_5shot.jsonl (measured)
 
-PRIME_STEPS=3200           # past the first rearrangement at step 3000
-MEASURE_STEPS=1000         # must end before the second one at step 6000
+# vLLM starts the rearrangement counter at 3/4 of the interval (eplb_state.py), so
+# rearrangements happen at steps interval/4, 5*interval/4, 9*interval/4, ...
+PRIME_STEPS=800            # past the first rearrangement at step 750
+MEASURE_STEPS=1000         # must end before the second one at step 3750
 
 case "$PHASE" in
   # Every step is decode: CONC tokens per rank. With --ignore-eos all requests
   # run OUTPUT_LEN steps, so CONC x DP requests take ~OUTPUT_LEN steps.
-  decode)  CONC=256; OUTPUT_LEN=512; MAX_NUM_SEQS=256; PREFIX_CACHING=--enable-prefix-caching ;;
+  decode)  CONC=${CONC:-64}; OUTPUT_LEN=512; PREFIX_CACHING=--enable-prefix-caching ;;
   # Every step prefills MNBT tokens on each of the DP ranks, so it finishes
-  # about DP x MNBT / PROMPT_LEN requests (8 x 8192 / 723 = ~90). CONC does not
+  # about DP x MNBT / PROMPT_LEN requests (8 x 2048 / 723 = ~23). CONC does not
   # change the step count; it only has to keep MNBT full on every rank
-  # (>= MNBT / PROMPT_LEN = ~12 requests per rank; 64 leaves room for uneven DP routing).
-  prefill) CONC=64;  OUTPUT_LEN=1;   MAX_NUM_SEQS=128; PREFIX_CACHING=--no-enable-prefix-caching ;;
+  # (>= MNBT / PROMPT_LEN = ~3 requests per rank; 64 leaves room for uneven DP routing).
+  prefill) CONC=${CONC:-64}; OUTPUT_LEN=1;   PREFIX_CACHING=--no-enable-prefix-caching ;;
   *)       echo "PHASE must be decode|prefill, got '$PHASE'"; exit 1 ;;
 esac
 
@@ -48,8 +52,10 @@ esac
 # memory problems still show; only the interval and step counts shrink.
 if [[ "$SMOKE" == 1 ]]; then
   case "$PHASE" in
-    decode)  STEP_INTERVAL=1000; PRIME_STEPS=1010; MEASURE_STEPS=500 ;;   # 2 + 1 batches of 512 steps
-    prefill) STEP_INTERVAL=100;  PRIME_STEPS=110;  MEASURE_STEPS=50  ;;
+    # rearrangements at 250 and 1250: prime 1 batch (512 steps), measure 1 batch (ends at 1024)
+    decode)  STEP_INTERVAL=1000; PRIME_STEPS=300; MEASURE_STEPS=500 ;;
+    # rearrangements at 25 and 125: prime to ~40, measure to ~90
+    prefill) STEP_INTERVAL=100;  PRIME_STEPS=40;  MEASURE_STEPS=50  ;;
   esac
   WINDOW=$STEP_INTERVAL
 fi
@@ -68,8 +74,17 @@ PRIME_PROMPTS=$(steps_to_prompts $PRIME_STEPS)
 MEASURE_PROMPTS=$(steps_to_prompts $MEASURE_STEPS)
 # -----------------------------------------------------------------------------
 
+# A vllm left over from an earlier run (killed with -9, closed session) still
+# holds the cards; refuse to start next to it.
+# Matched on the process name: "vllm" for the server, "VLLM::..." for its engines and workers.
+if leftover=$(pgrep -d, -u "$(id -u)" '^(vllm|VLLM::)'); then
+  echo "leftover vllm processes of yours, stop them first:"
+  ps -o pid,etime,cmd -p "$leftover" | cut -c1-150
+  exit 1
+fi
+
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-OUT_DIR=$SCRIPT_DIR/eplb_bench_results/${GPU}_${PHASE}$([[ "$SMOKE" == 1 ]] && echo _smoke)_$(date +%m%d_%H%M)
+OUT_DIR=$SCRIPT_DIR/eplb_bench_results/${PHASE}$([[ "$SMOKE" == 1 ]] && echo _smoke)_$(date +%m%d_%H%M)
 mkdir -p "$OUT_DIR"
 
 # GSM8K test set as 5-shot prompts, built like vLLM's tests/evals/gsm8k/gsm8k_eval.py.
@@ -92,7 +107,7 @@ os.replace(sys.argv[1] + ".tmp", sys.argv[1])
 EOF
 fi
 
-echo "== $GPU $PHASE$([[ "$SMOKE" == 1 ]] && echo " SMOKE"), modes: $MODES"
+echo "== $PHASE$([[ "$SMOKE" == 1 ]] && echo " SMOKE"), modes: $MODES"
 echo "   DP$DP, conc $CONC/rank, mnbt $MNBT, output $OUTPUT_LEN, interval $STEP_INTERVAL"
 echo "   prime $PRIME_PROMPTS prompts (~$PRIME_STEPS steps), measure $MEASURE_PROMPTS prompts (~$MEASURE_STEPS steps)"
 echo "   -> $OUT_DIR"
@@ -109,10 +124,18 @@ SERVER_PID=""
 stop_server() {
   [[ -n "$SERVER_PID" ]] || return 0
   kill -- -"$SERVER_PID" 2>/dev/null || true   # the whole process group (setsid)
+  # Wait for every process in the group, not just the leader: the engine cores
+  # hold the cards, and a new server next to them fails with OUT_OF_RESOURCES.
+  for _ in $(seq 1 60); do
+    pgrep -g "$SERVER_PID" > /dev/null || break
+    sleep 1
+  done
+  pgrep -g "$SERVER_PID" > /dev/null && kill -9 -- -"$SERVER_PID" 2>/dev/null
   wait "$SERVER_PID" 2>/dev/null || true
   SERVER_PID=""
-  sleep 5   # let the cards release memory
+  sleep 5   # let the driver release the memory
 }
+
 trap stop_server EXIT
 trap 'exit 130' INT TERM HUP PIPE   # so Ctrl-C, kill or a closed terminal also stop the server
 
@@ -122,7 +145,7 @@ start_server() {
   setsid env PYTHONUNBUFFERED=1 ZE_AFFINITY_MASK=$CARDS vllm serve "$MODEL" \
     --host 0.0.0.0 --port 9999 --gpu-memory-utilization $GPU_MEM_UTIL \
     --data-parallel-size $DP --enable-expert-parallel $(eplb_args "$mode") $PREFIX_CACHING \
-    --max-num-batched-tokens $MNBT --max-num-seqs $MAX_NUM_SEQS --max-model-len 2048 \
+    --max-num-batched-tokens $MNBT \
     > "$log" 2>&1 &
   SERVER_PID=$!
 
@@ -136,8 +159,10 @@ start_server() {
 }
 
 # send_requests <mode> <prime|measure> <num_prompts>
+# --ready-check-timeout-sec 0 skips bench's initial single-request test run: with
+# --ignore-eos it alone runs OUTPUT_LEN steps, which count toward the EPLB interval.
 send_requests() {
-  vllm bench serve --model "$MODEL" --host 0.0.0.0 --port 9999 \
+  vllm bench serve --model "$MODEL" --host 0.0.0.0 --port 9999 --ready-check-timeout-sec 0 \
     --dataset-name custom --dataset-path "$DATASET" --skip-chat-template \
     --custom-output-len $OUTPUT_LEN --ignore-eos \
     --num-prompts "$3" --request-rate inf --max-concurrency $((CONC * DP)) \
